@@ -55,6 +55,64 @@ class InvoiceTests(unittest.TestCase):
         t = self.invoice()["totals"]
         self.assertEqual((t["subtotal_cents"], t["tax_cents"], t["total_cents"]), (440000, 22000, 462000))
 
+    def test_customer_contact_requirements(self):
+        with self.assertRaisesRegex(Error, "email address or postal address"):
+            self.app.add_customer("missing", "Missing", " ", " ")
+        with self.assertRaises(Error):
+            self.app.update_customer("acme", address="", email="")
+        self.assertEqual(self.app.customer("acme")["address"], "456 Client Street")
+        out, err = self.cli("customer", "add", "--slug", "email-only", "--name", "Email Only",
+                            "--email", "billing@example.com")
+        self.assertFalse(err)
+        self.assertIn("Added email-only", out)
+        inv = self.app.create("email-only", "2026-10-26")
+        self.app.add_line(inv["id"], dict(description="Service", quantity="1", unit="each", unit_price="10"))
+        self.assertEqual(self.app.post(inv["id"])["status"], "posted")
+
+    def test_business_contact_requirements_and_multiline_address(self):
+        out, err = self.cli("config", "set", "business-address", "--address-line", "123 Supplier St",
+                            "--address-line", "Vancouver BC")
+        self.assertFalse(err)
+        self.config = Config(self.config.path)
+        self.app = App(self.store, self.config)
+        self.assertEqual(self.config.values["business-address"], "123 Supplier St\nVancouver BC")
+        inv = self.invoice()
+        self.assertEqual(inv["business"]["address"], "123 Supplier St\nVancouver BC")
+        self.config.set("business-address", "")
+        self.config.set("business-email", "")
+        self.app.update(inv["id"], refresh=True)
+        with self.assertRaisesRegex(Error, "business email or postal address"):
+            self.app.post(inv["id"])
+        self.config.set("business-email", "supplier@example.com")
+        with self.assertRaises(Error):
+            self.app.post(inv["id"])
+        self.app.update(inv["id"], refresh=True)
+        posted = self.app.post(inv["id"])
+        self.assertEqual(posted["business"]["email"], "supplier@example.com")
+        self.config.set("business-email", "new@example.com")
+        self.assertEqual(self.app.invoice(inv["id"]), posted)
+
+    def test_customer_multiline_address_cli_and_snapshots(self):
+        inv = self.invoice()
+        out, err = self.cli("customer", "update", "acme", "--address-line", "39614 Highway 16",
+                            "--address-line", "PO Box 10", "--address-line", "Tlell BC V0T1Y0")
+        self.assertFalse(err)
+        address = "39614 Highway 16\nPO Box 10\nTlell BC V0T1Y0"
+        self.assertEqual(self.app.customer("acme")["address"], address)
+        self.assertEqual(self.app.invoice(inv["id"]), inv)
+        self.app.update(inv["id"], refresh=True)
+        out, _ = self.cli("show", str(inv["id"]))
+        self.assertIn(address, out)
+        from pypdf import PdfReader
+        output = render(self.app.invoice(inv["id"]), self.root / "address.pdf")
+        text = "\n".join(page.extract_text() for page in PdfReader(output).pages)
+        for line in address.splitlines():
+            self.assertIn(line, text)
+        out, err = self.cli("customer", "add", "--slug", "postal-only", "--name", "Postal Only",
+                            "--address-line", "123 Main St", "--address-line", "Vancouver BC")
+        self.assertFalse(err)
+        self.assertEqual(self.app.customer("postal-only")["address"], "123 Main St\nVancouver BC")
+
     def test_fractional_hours_and_rounding(self):
         inv = self.app.create("acme")
         self.app.add_line(inv["id"], dict(description="Tiny", quantity="1", unit="each", unit_price="0.105"))
@@ -78,6 +136,18 @@ class InvoiceTests(unittest.TestCase):
         self.assertEqual(inv["totals"]["tax_cents"], 500)
         self.assertEqual([x["tax"] for x in inv["lines"]], ["GST", "exempt", "zero-rated", "none"])
 
+    def test_csv_tax_whitespace_and_case_preserve_reviewed_rate(self):
+        inv = self.invoice()
+        self.app.add_tax("GST", "7", effective="2026-01-01")
+        text = "description,quantity,unit,unit_price,tax\nDevelopment,24,hour,150, gst \n"
+        lines = import_csv(self.app, inv, text)
+        self.assertEqual((lines[0]["tax"], lines[0]["tax_rate"]), ("GST", "5"))
+        self.app.add_tax("gst", "3")
+        with self.assertRaises(Error):
+            import_csv(self.app, inv, text.replace(" gst ", " GsT "))
+        lines = import_csv(self.app, inv, text)
+        self.assertEqual((lines[0]["tax"], lines[0]["tax_rate"]), ("gst", "3"))
+
     def test_tax_effective_date_and_frozen_drafts(self):
         inv = self.invoice()
         self.app.add_tax("GST", "7", effective="2026-10-01")
@@ -86,6 +156,84 @@ class InvoiceTests(unittest.TestCase):
         self.assertEqual(self.app.invoice(inv["id"])["totals"]["tax_cents"], 30800)
         self.app.update(inv["id"], issue="2026-09-30")
         self.assertEqual(self.app.invoice(inv["id"])["totals"]["tax_cents"], 22000)
+
+    def test_cli_update_tax_and_snapshots(self):
+        draft = self.invoice()
+        posted = self.invoice(posted=True)
+        out, err = self.cli("tax", "update", "GST", "--rate", "7", "--label", "Updated GST",
+                            "--new-effective", "2026-01-01")
+        self.assertFalse(err)
+        self.assertIn("Updated GST", out)
+        self.assertEqual(self.app.tax("GST", "2026-10-26"), ("Updated GST", "7"))
+        with self.assertRaises(Error):
+            self.app.tax("GST", "2025-12-31")
+        self.assertEqual(self.app.invoice(draft["id"]), draft)
+        self.assertEqual(self.app.invoice(posted["id"]), posted)
+        self.app.update(draft["id"], refresh_tax=True)
+        self.assertEqual(self.app.invoice(draft["id"])["totals"]["tax_cents"], 30800)
+        self.cli("tax", "update", "GST", "--label", "Renamed")
+        self.assertEqual(self.app.tax("GST", "2026-10-26"), ("Renamed", "7"))
+
+    def test_tax_update_selection_and_validation(self):
+        self.app.add_tax("GST", "6", effective="2030-01-01")
+        original = [tuple(row) for row in self.app.db.execute("SELECT * FROM tax_rates ORDER BY effective_from")]
+        for code, values in [
+            ("GST", dict(rate="8")),
+            ("MISSING", dict(rate="8")),
+            ("none", dict(rate="8")),
+            ("GST", dict(effective="2029-01-01", rate="8")),
+            ("GST", dict(effective="0001-01-01", new_effective="2030-01-01")),
+            ("GST", dict(effective="0001-01-01", new_effective="invalid")),
+            ("GST", dict(effective="0001-01-01", label=" ")),
+            ("GST", dict(effective="0001-01-01")),
+            *[("GST", dict(effective="0001-01-01", rate=rate)) for rate in ["NaN", "-1", "101"]],
+        ]:
+            with self.subTest(code=code, values=values), self.assertRaises(Error):
+                self.app.update_tax(code, **values)
+            self.assertEqual([tuple(row) for row in self.app.db.execute("SELECT * FROM tax_rates ORDER BY effective_from")], original)
+        out, err = self.cli("tax", "update", "GST", "--effective", "2030-01-01", "--rate", "0")
+        self.assertFalse(err)
+        self.assertIn("Updated GST", out)
+        self.assertEqual(self.app.tax("GST", "2030-01-01"), ("GST", "0"))
+        self.assertEqual(self.app.tax("GST", "2029-12-31"), ("GST", "5"))
+
+    def test_tax_snapshot_listing(self):
+        draft = self.invoice()
+        posted = self.invoice(posted=True)
+        out, err = self.cli("tax", "update", "GST", "--rate", "7", "--label", "New GST")
+        self.assertFalse(err)
+        self.assertIn(f"{draft['id']:06d}  draft", out)
+        self.assertIn(f"{posted['id']:06d}  posted", out)
+        self.assertIn("saved: 5% GST  applicable now: 7% New GST", out)
+        self.assertIn(f"invoice update {draft['id']:06d} --refresh-tax", out)
+        self.assertNotIn(f"invoice update {posted['id']:06d} --refresh-tax", out)
+        self.assertEqual(self.app.invoice(draft["id"]), draft)
+        again, err = self.cli("tax", "snapshots", "GST")
+        self.assertFalse(err)
+        self.assertIn("saved: 5% GST", again)
+        self.app.update(draft["id"], refresh_tax=True)
+        out, _ = self.cli("tax", "snapshots", "GST")
+        self.assertNotIn(f"invoice update {draft['id']:06d} --refresh-tax", out)
+        self.app.update_tax("GST", new_effective="2030-01-01")
+        out, _ = self.cli("tax", "snapshots", "GST")
+        self.assertIn("unavailable on issue date", out)
+        out, _ = self.cli("tax", "snapshots", "unused")
+        self.assertIn("No invoice snapshots", out)
+
+    def test_line_tax_labels_in_terminal_and_pdf(self):
+        from pypdf import PdfReader
+        inv = self.invoice()
+        self.app.update_tax("GST", label="Sales tax")
+        self.app.update(inv["id"], refresh_tax=True)
+        inv = self.app.invoice(inv["id"])
+        out, err = self.cli("show", str(inv["id"]))
+        self.assertFalse(err)
+        self.assertIn("Sales tax 5%", out)
+        self.assertNotIn("GST 5%", out)
+        output = render(inv, self.root / "labels.pdf")
+        text = " ".join(page.extract_text() for page in PdfReader(output).pages)
+        self.assertIn("Sales tax 5%", " ".join(text.split()))
+        self.assertNotIn("GST 5%", " ".join(text.split()))
 
     def test_note_defaults_override_and_clear(self):
         inv = self.app.create("acme")
@@ -113,7 +261,7 @@ class InvoiceTests(unittest.TestCase):
         self.store.set_next(1000000)
         inv = self.app.create("acme")
         self.assertEqual(public_invoice(inv)["id"], "1000000")
-        self.assertEqual(destination(inv).name, "1000000-acme.pdf")
+        self.assertEqual(destination(inv).name, "invoice-acme-1000000-draft.pdf")
 
     def test_sequence_rejects_invalid_values(self):
         for value in [0, -1, 9223372036854775808, "not-an-id"]:
@@ -302,7 +450,7 @@ class InvoiceTests(unittest.TestCase):
     def test_pdf_paths_and_no_clobber(self):
         inv = self.invoice(posted=True)
         output = render(inv, str(self.root / "exports") + "/")
-        self.assertEqual(output.name, "000001-acme.pdf")
+        self.assertEqual(output.name, f"invoice-acme-000001-{inv['posted_at'][:10]}.pdf")
         self.assertTrue(output.read_bytes().startswith(b"%PDF"))
         original = output.read_bytes()
         with self.assertRaises(Error):
@@ -312,6 +460,15 @@ class InvoiceTests(unittest.TestCase):
         render(inv, output, overwrite=True)
         with self.assertRaises(Error):
             destination(inv, "missing-directory-without-slash")
+
+    def test_pdf_filename_uses_posted_date(self):
+        inv = self.invoice()
+        self.assertEqual(destination(inv).name, "invoice-acme-000001-draft.pdf")
+        inv["posted_at"] = "2027-03-04T12:34:56+00:00"
+        inv["status"] = "posted"
+        self.assertEqual(destination(inv).name, "invoice-acme-000001-2027-03-04.pdf")
+        inv["status"] = "void"
+        self.assertEqual(destination(inv).name, "invoice-acme-000001-2027-03-04.pdf")
 
     def test_pdf_values_unicode_and_multipage(self):
         from pypdf import PdfReader

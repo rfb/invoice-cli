@@ -27,6 +27,7 @@ invoice init --next-id 1234
 invoice config set business-name "Example Consulting"
 invoice config set business-address "123 Example Road, BC, Canada"
 invoice config set business-email "billing@example.com"
+invoice config set business-email "billing@example.com"
 invoice config set gst-number "123456789RT0001"
 invoice config set currency CAD
 invoice config set payment-terms 30
@@ -40,7 +41,26 @@ invoice customer add --slug acme --name "Acme Ltd." \
 
 These are example business details and a sample tax configuration. Replace them with yours. Rates are configurable; the tool does not determine tax eligibility or jurisdiction. Tax is not configured automatically.
 
-`customer add` prompts for missing slug, name, or address when run in a terminal. In scripts, provide all three flags. Multiline addresses/notes may be supplied as a single quoted argument containing newlines. `invoice config show` displays the available flat settings and their current values.
+Customers require a name and either an email address or a postal address; both are allowed. `customer add` prompts for missing slug and name when run in a terminal. If neither contact field is supplied, it prompts for email, then a multiline postal address if email is left blank (finish the address with a blank line). In scripts, supply `--slug`, `--name`, and at least one contact field. For multiline addresses, repeat `--address-line` on `customer add` or `customer update`, or pass literal newlines in one `--address` argument. `invoice config show` displays the available flat settings and their current values.
+
+```sh
+invoice customer update richardson-ranch \
+  --address-line "39614 Highway 16" \
+  --address-line "PO Box 10" \
+  --address-line "Tlell BC V0T1Y0"
+invoice customer update richardson-ranch --email "billing@example.com"
+```
+
+Your own supplier details use `business-name`, `business-email`, and `business-address`. Posting requires your name and either email or postal address; both are allowed. Configuration can be filled in one setting at a time. Set a multiline supplier address with:
+
+```sh
+invoice config set business-address \
+  --address-line "123 Supplier Street" \
+  --address-line "Vancouver BC" \
+  --address-line "V0V 0V0"
+```
+
+Customer and supplier updates affect new invoices. Apply them to an existing draft with `invoice update ID --refresh-details`. Posted invoices keep their saved details.
 
 ## Everyday workflow
 
@@ -58,7 +78,7 @@ invoice show 1234
 export EDITOR='nano'  # Or: export VISUAL='code --wait'
 invoice edit 1234
 invoice update 1234 --note "Payment due under our service agreement."
-invoice pdf 1234        # Draft preview: ./001234-acme.pdf
+invoice pdf 1234        # Draft preview: ./invoice-acme-001234-draft.pdf
 invoice post 1234       # Finalize the same ID; does not generate a PDF
 invoice pdf 1234 --overwrite
 ```
@@ -102,7 +122,7 @@ invoice item add 1234 "Other service" --amount 200 --tax exempt
 "Website deployment","1","each","800.00","GST"
 ```
 
-Add/delete/reorder rows naturally. Hourly work is quantity × rate with unit `hour`; fixed-price work uses quantity 1 and unit `each`. Unit is a label, not an enum. Tax is required on every row. Amounts/totals and invoice metadata are not editable in this file.
+Add/delete/reorder rows naturally. Hourly work is quantity × rate with unit `hour`; fixed-price work uses quantity 1 and unit `each`. Unit is a label, not an enum. Tax is required on every row. Surrounding spaces in tax codes are ignored; capitalization is matched when unambiguous (for example, ` gst` resolves to `GST`). Amounts/totals and invoice metadata are not editable in this file.
 
 CSV quoting supports commas, quotes, and multiline descriptions. A line starting with `#` in column one is a comment only outside a quoted field. Quote descriptions beginning with `#`; the exporter quotes all fields automatically. `#` lines inside a quoted multiline description remain data. Empty lines outside quoted fields are ignored. Header names/order must match exactly.
 
@@ -129,10 +149,14 @@ Each line has one tax code or built-in treatment:
 
 ```sh
 invoice tax list
+invoice tax snapshots GST
 invoice tax add GST --rate 6 --effective 2030-01-01 --label GST
+invoice tax update GST --effective 2030-01-01 --rate 7 --label "Goods and Services Tax" --new-effective 2030-07-01
 ```
 
-The future rate above is illustrative, not a predicted rate change. Codes and their effective dates are unique; existing definitions are not overwritten. The rate with the latest effective date on or before the issue date is selected. You can configure different codes on different lines; stacking or compounding taxes on one line is not implemented.
+The future rates above are illustrative, not predicted rate changes. Codes and their effective dates are unique; adding a definition never overwrites one. Use `tax update` to change any combination of rate, label, and effective date. `--effective` selects the existing definition and may be omitted when the code has only one definition; `--new-effective` changes its date. Updates cannot collide with another definition's date or edit built-in treatments. Existing invoice snapshots stay unchanged; use `invoice update ID --refresh-tax` to apply changes to a draft. The rate with the latest effective date on or before the issue date is selected. You can configure different codes on different lines; stacking or compounding taxes on one line is not implemented.
+
+`tax update` also lists invoices using the code, their saved rates/labels, and the rates/labels currently applicable on their issue dates. It prints refresh commands for drafts whose snapshots differ. Use `tax snapshots CODE` to view the list again. Refreshing a draft updates all its taxes; posted and void invoices cannot be refreshed.
 
 Prices are before tax. Quantity and unit price allow up to six decimal places; quantity must be positive, price nonnegative. Nonfinite values and negative amounts are rejected. Decimal arithmetic rounds each line's net amount to cents, then its tax to cents using ROUND_HALF_UP; invoice totals sum those rounded values. This is the app's explicit rounding policy, not a claim about a universal tax rule. Supported currencies are CAD, USD, EUR, GBP, AUD, NZD, and CHF, all with two decimal places. No exchange conversion.
 
@@ -155,7 +179,7 @@ invoice update 1234 --refresh-details
 invoice update 1234 --note ""  # Clear this invoice's note
 ```
 
-Posting requires business and customer names/addresses, valid dates, at least one line, and applicable tax setup. It freezes the financial content and finalized totals. CLI and PDF use the same snapshots; changing configuration, customers, or tax definitions cannot alter an issued invoice. Posting twice is safe and never changes its ID or allocates a new one.
+Posting requires business and customer names, each with email or postal address (or both), valid dates, at least one line, and applicable tax setup. It freezes the financial content and finalized totals. CLI and PDF use the same snapshots; changing configuration, customers, or tax definitions cannot alter an issued invoice. Posting twice is safe and never changes its ID or allocates a new one.
 
 ```sh
 invoice list --customer acme
@@ -171,12 +195,12 @@ Voiding retains the original number, items, and totals with a reason/date. It is
 ## PDF output
 
 ```sh
-invoice pdf 1234                         # ./001234-acme.pdf
-invoice pdf 1234 --output ./exports/     # ./exports/001234-acme.pdf
+invoice pdf 1234                         # ./invoice-acme-001234-YYYY-MM-DD.pdf
+invoice pdf 1234 --output ./exports/     # ./exports/invoice-acme-001234-YYYY-MM-DD.pdf
 invoice pdf 1234 --output ./custom.pdf   # Explicit filename override
 ```
 
-Existing directories receive the generated filename. End a new directory path with `/`; otherwise the destination must be a `.pdf` file. No files are silently overwritten, even when regenerating the same invoice: use `--overwrite`. Publication is atomic. The printed path tells you where the output went.
+Default filenames are `invoice-SLUG-ID-POSTED_DATE.pdf`, with a six-digit minimum invoice ID and the saved posting date in `YYYY-MM-DD` format. Draft previews use `draft` in place of the posting date. Voided invoices retain their original posting date. Existing directories receive the generated filename. End a new directory path with `/`; otherwise the destination must be a `.pdf` file. No files are silently overwritten, even when regenerating the same invoice: use `--overwrite`. Publication is atomic. The printed path tells you where the output went.
 
 Drafts and voids are visibly marked on all pages. Tables repeat headers and wrap/split long descriptions. Totals stay together. The bundled DejaVu Sans fonts support common accented names and punctuation; they do not cover every writing system. Retain the originally issued PDF: financial content is stable, but regenerated PDF bytes/layout are not a long-term archival guarantee across software versions.
 

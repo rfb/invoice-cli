@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal
 import json
 from pathlib import Path
 import sqlite3
@@ -27,7 +28,8 @@ def parser():
     config.add_parser("show")
     setting = config.add_parser("set")
     setting.add_argument("key")
-    setting.add_argument("value")
+    setting.add_argument("value", nargs="?")
+    setting.add_argument("--address-line", action="append", help="Business postal address line; repeat for each line")
     seq = commands.add_parser("sequence").add_subparsers(dest="action", required=True)
     seq.add_parser("show")
     setter = seq.add_parser("set-next")
@@ -41,7 +43,9 @@ def parser():
             c.add_argument("--slug")
         if action in {"add", "update"}:
             c.add_argument("--name")
-            c.add_argument("--address")
+            address = c.add_mutually_exclusive_group()
+            address.add_argument("--address", help="Postal address; may contain literal newlines")
+            address.add_argument("--address-line", action="append", help="Postal address line; repeat for each line")
             c.add_argument("--email")
     taxes = commands.add_parser("tax").add_subparsers(dest="action", required=True)
     tax = taxes.add_parser("add")
@@ -49,6 +53,14 @@ def parser():
     tax.add_argument("--rate", required=True)
     tax.add_argument("--label")
     tax.add_argument("--effective", default="0001-01-01", help="Effective date, YYYY-MM-DD")
+    tax_update = taxes.add_parser("update", help="Edit an existing tax definition")
+    tax_update.add_argument("code")
+    tax_update.add_argument("--effective", help="Select the existing effective date (required if multiple definitions exist)")
+    tax_update.add_argument("--new-effective", help="Change the effective date, YYYY-MM-DD")
+    tax_update.add_argument("--rate")
+    tax_update.add_argument("--label")
+    tax_snapshots = taxes.add_parser("snapshots", help="List invoice snapshots using a tax code")
+    tax_snapshots.add_argument("code")
     taxes.add_parser("list")
     new = commands.add_parser("new")
     new.add_argument("--customer", required=True)
@@ -142,6 +154,36 @@ def line_values(args, *, adding=False):
     return values
 
 
+def show_tax_snapshots(app, code):
+    rows = app.db.execute(
+        "SELECT DISTINCT i.id,i.status,i.issue_date,l.tax_label,l.tax_rate "
+        "FROM invoices i JOIN line_items l ON l.invoice_id=i.id "
+        "WHERE l.tax=? ORDER BY i.id,l.tax_rate,l.tax_label", (code,)).fetchall()
+    if not rows:
+        print(f"No invoice snapshots use {code}.")
+        return
+    print(f"Invoice snapshots using {code}:")
+    drafts = set()
+    for row in rows:
+        try:
+            label, rate = app.tax(code, row["issue_date"])
+            current = f"{rate}% {label}"
+            changed = (Decimal(rate), label) != (Decimal(row["tax_rate"]), row["tax_label"])
+        except Error:
+            current = "unavailable on issue date"
+            changed = False
+        print(f"  {row['id']:06d}  {row['status']:<6}  {row['issue_date']}  "
+              f"saved: {row['tax_rate']}% {row['tax_label']}  applicable now: {current}")
+        if row["status"] == "draft" and changed:
+            drafts.add(row["id"])
+    if drafts:
+        print("To apply current rates and labels to drafts (refreshes all taxes on each invoice):")
+        for ref in sorted(drafts):
+            print(f"  invoice update {ref:06d} --refresh-tax")
+    if any(row["status"] != "draft" for row in rows):
+        print("Posted and void invoice snapshots are fixed and cannot be refreshed.")
+
+
 def dispatch(args):
     paths = Paths.resolve(args.db, args.config)
     config = Config(paths.config)
@@ -151,6 +193,12 @@ def dispatch(args):
         elif args.action == "show":
             print(json.dumps(config.values, ensure_ascii=False, indent=2))
         else:
+            if args.address_line is not None:
+                if args.key != "business-address" or args.value is not None:
+                    raise Error("Use --address-line only with config set business-address, without a value argument")
+                args.value = "\n".join(args.address_line)
+            if args.value is None:
+                raise Error("Supply a setting value (or --address-line for business-address)")
             config.set(args.key, args.value)
             print(f"Set {args.key}")
         return
@@ -168,9 +216,25 @@ def dispatch(args):
                 store.set_next(args.value)
             print(f"Next invoice: {store.next_id():06d}")
         elif args.command == "customer":
+            if args.action in {"add", "update"} and args.address_line is not None:
+                args.address = "\n".join(args.address_line)
             if args.action == "add":
-                customer = app.add_customer(required(args.slug, "slug"), required(args.name, "name"),
-                                            required(args.address, "address"), args.email or "")
+                slug = required(args.slug, "slug")
+                name = required(args.name, "name")
+                address = args.address or ""
+                email = args.email or ""
+                if not address.strip() and not email.strip() and sys.stdin.isatty():
+                    email = input("email (optional if postal address supplied): ").strip()
+                    if not email:
+                        print("Postal address (one line at a time; blank line to finish):")
+                        lines = []
+                        while True:
+                            line = input()
+                            if not line.strip():
+                                break
+                            lines.append(line)
+                        address = "\n".join(lines)
+                customer = app.add_customer(slug, name, address, email)
                 print(f"Added {customer['slug']}: {customer['name']}")
             elif args.action == "update":
                 app.update_customer(args.slug, name=args.name, address=args.address, email=args.email)
@@ -184,6 +248,13 @@ def dispatch(args):
             if args.action == "add":
                 app.add_tax(args.code, args.rate, args.label, args.effective)
                 print(f"Added {args.code} {args.rate}% effective {args.effective}; existing drafts unchanged")
+            elif args.action == "update":
+                app.update_tax(args.code, effective=args.effective, new_effective=args.new_effective,
+                               rate=args.rate, label=args.label)
+                print(f"Updated {args.code}; existing invoice snapshots unchanged")
+                show_tax_snapshots(app, args.code)
+            elif args.action == "snapshots":
+                show_tax_snapshots(app, args.code)
             else:
                 for row in app.db.execute("SELECT * FROM tax_rates ORDER BY code,effective_from"):
                     print(f"{row['code']:<16} {row['rate']:>10}%  {row['effective_from']}  {row['label']}")

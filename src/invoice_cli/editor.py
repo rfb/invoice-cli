@@ -85,6 +85,9 @@ def comment_aware_lines(text):
 
 
 def import_csv(app, invoice, text):
+    codes = {"exempt", "zero-rated", "none"}
+    codes.update(row[0] for row in app.db.execute("SELECT DISTINCT code FROM tax_rates"))
+    codes.update(line["tax"] for line in invoice["lines"])
     reader = csv.reader(comment_aware_lines(text), strict=True)
     result = []
     header = False
@@ -100,6 +103,12 @@ def import_csv(app, invoice, text):
             if len(row) != len(COLUMNS):
                 raise Error(f"Line {reader.line_num}: expected 5 columns, got {len(row)}")
             values = dict(zip(COLUMNS, row))
+            code = values["tax"].strip()
+            if code not in codes:
+                alternatives = [candidate for candidate in codes if candidate.casefold() == code.casefold()]
+                if len(alternatives) == 1:
+                    code = alternatives[0]
+            values["tax"] = code
             matches = [x for x in invoice["lines"] if x["tax"] == values["tax"]]
             exact = [x for x in matches if all(str(x[k]) == values[k] for k in COLUMNS)]
             described = [x for x in matches if x["description"] == values["description"] and x["unit"] == values["unit"]]

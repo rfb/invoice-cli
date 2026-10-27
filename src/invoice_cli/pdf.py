@@ -19,7 +19,8 @@ from .storage import Error, private_dir
 
 
 def destination(inv, output=None):
-    basename = f"{inv['id']:06d}-{inv['customer']['slug']}.pdf"
+    posted_date = inv["posted_at"][:10] if inv.get("posted_at") else "draft"
+    basename = f"invoice-{inv['customer']['slug']}-{inv['id']:06d}-{posted_date}.pdf"
     if output is None:
         return Path.cwd() / basename
     raw = str(output)
@@ -69,8 +70,8 @@ def render(inv, output=None, overwrite=False):
     story += [table, Spacer(1, 12), metadata, Spacer(1, 12)]
     rows = [[para(x, small) for x in ["Description", "Quantity", "Unit price", "Tax", "Amount"]]]
     for item in inv["lines"]:
-        tax = item["tax"]
-        if tax not in {"exempt", "zero-rated", "none"}:
+        tax = item["tax_label"]
+        if item["tax"] not in {"exempt", "zero-rated", "none"}:
             tax += f" {item['tax_rate']}%"
         rows.append([para(item["description"], small), para(f"{item['quantity']} {item['unit']}", right),
                      para(price_display(item["unit_price"]), right), para(tax, small), para(money(item["net_cents"]), right)])

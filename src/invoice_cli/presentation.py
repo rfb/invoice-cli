@@ -21,7 +21,7 @@ def show(inv):
         for physical in line["description"].splitlines():
             parts.extend(textwrap.wrap(physical, width=34) or [""])
         qty = f"{line['quantity']} {line['unit']}"
-        tax = line["tax"] + (f" {line['tax_rate']}%" if line["tax"] not in {"exempt", "zero-rated", "none"} else "")
+        tax = line["tax_label"] + (f" {line['tax_rate']}%" if line["tax"] not in {"exempt", "zero-rated", "none"} else "")
         out.append(f"{index:>3}  {parts[0]:<34} {qty:<18} {price_display(line['unit_price']):>14} {money(line['net_cents']):>17}  {tax}")
         out.extend("     " + part for part in parts[1:])
     t = inv["totals"]

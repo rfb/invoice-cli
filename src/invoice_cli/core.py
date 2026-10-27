@@ -71,6 +71,8 @@ class App:
             raise Error("Slug must use lowercase ASCII letters/digits separated by hyphens")
         if not name.strip():
             raise Error("Customer name is required")
+        if not address.strip() and not email.strip():
+            raise Error("Customer requires an email address or postal address (or both)")
         if self.db.execute("SELECT 1 FROM customers WHERE slug=?", (slug,)).fetchone():
             raise Error(f"Customer slug {slug!r} is already in use")
         with self.store.transaction():
@@ -84,6 +86,8 @@ class App:
                 customer[key] = value
         if not customer["name"].strip():
             raise Error("Customer name is required")
+        if not customer["address"].strip() and not customer["email"].strip():
+            raise Error("Customer requires an email address or postal address (or both)")
         with self.store.transaction():
             self.db.execute("UPDATE customers SET name=?,address=?,email=? WHERE id=?",
                             (customer["name"], customer["address"], customer["email"], customer["id"]))
@@ -95,9 +99,39 @@ class App:
         iso_date(effective)
         rate = str(decimal(rate, "tax rate", maximum=Decimal(100)))
         if self.db.execute("SELECT 1 FROM tax_rates WHERE code=? AND effective_from=?", (code, effective)).fetchone():
-            raise Error("That code/effective date already exists. Add a new effective date instead.")
+            raise Error("That code/effective date already exists. Use tax update or add a new effective date.")
         with self.store.transaction():
             self.db.execute("INSERT INTO tax_rates VALUES(?,?,?,?)", (code, label or code, rate, effective))
+
+    def update_tax(self, code, *, effective=None, new_effective=None, rate=None, label=None):
+        if code in TREATMENTS:
+            raise Error("Built-in tax treatments cannot be edited")
+        if all(value is None for value in (new_effective, rate, label)):
+            raise Error("Specify --rate, --label or --new-effective to update")
+        if effective is not None:
+            iso_date(effective)
+        if new_effective is not None:
+            iso_date(new_effective)
+        if rate is not None:
+            rate = str(decimal(rate, "tax rate", maximum=Decimal(100)))
+        if label is not None and not label.strip():
+            raise Error("Tax label is required")
+        with self.store.transaction():
+            rows = self.db.execute("SELECT * FROM tax_rates WHERE code=? ORDER BY effective_from", (code,)).fetchall()
+            if effective is not None:
+                rows = [row for row in rows if row["effective_from"] == effective]
+            if not rows:
+                raise Error(f"Tax definition {code!r} not found" + (f" effective {effective}" if effective else ""))
+            if len(rows) > 1:
+                raise Error("Multiple tax definitions exist; select one with --effective YYYY-MM-DD")
+            row = rows[0]
+            target = new_effective if new_effective is not None else row["effective_from"]
+            if target != row["effective_from"] and self.db.execute(
+                    "SELECT 1 FROM tax_rates WHERE code=? AND effective_from=?", (code, target)).fetchone():
+                raise Error("That code/effective date already exists")
+            self.db.execute("UPDATE tax_rates SET label=?,rate=?,effective_from=? WHERE code=? AND effective_from=?",
+                            (label if label is not None else row["label"],
+                             rate if rate is not None else row["rate"], target, code, row["effective_from"]))
 
     def tax(self, code, issue_date):
         if code in TREATMENTS:
@@ -271,9 +305,10 @@ class App:
             if inv["status"] != "draft":
                 raise Error("Cannot post a void invoice")
             for kind in ("business", "customer"):
-                for field in ("name", "address"):
-                    if not inv[kind][field].strip():
-                        raise Error(f"Set {kind} {field} before posting (then refresh draft details if needed)")
+                if not inv[kind]["name"].strip():
+                    raise Error(f"Set {kind} name before posting (then refresh draft details if needed)")
+                if not inv[kind]["address"].strip() and not inv[kind]["email"].strip():
+                    raise Error(f"Set {kind} email or postal address before posting (then refresh draft details if needed)")
             if not inv["lines"]:
                 raise Error("Add at least one line item before posting")
             for line in inv["lines"]:
